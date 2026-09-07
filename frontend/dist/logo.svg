@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 48" fill="none">
+  <rect width="44" height="44" rx="12" fill="#0F766E"/>
+  <path d="M22 12C20 12 18 13.5 17 15.5C16 13.5 14 12 12 12C8.686 12 6 14.686 6 18C6 24 16 31 22 34C28 31 38 24 38 18C38 14.686 35.314 12 32 12C30 12 28 13.5 27 15.5C26 13.5 24 12 22 12Z" fill="#CCFBF1" opacity="0.3"/>
+  <path d="M14 23H18L20 17L24 29L26 21L28 23H30" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="54" y="30" font-family="Plus Jakarta Sans, system-ui, -apple-system, sans-serif" font-size="22" font-weight="800" fill="#0F172A" letter-spacing="-0.5px">Telemed</text>
+</svg>

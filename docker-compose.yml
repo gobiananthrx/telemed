@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  telemed-postgres:
+    image: postgres:16-alpine
+    container_name: telemed-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-telemed_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-telemed_password}
+      POSTGRES_DB: ${POSTGRES_DB:-telemed_db}
+    ports:
+      - "${POSTGRES_PORT:-5434}:5432"
+    volumes:
+      - telemed_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-telemed_user} -d ${POSTGRES_DB:-telemed_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  telemed_pgdata:
+    name: telemed_pgdata
