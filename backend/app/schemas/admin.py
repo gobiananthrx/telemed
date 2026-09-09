@@ -3,6 +3,8 @@ from typing import Optional, List
 from app.schemas.user import DoctorProfileResponse, PatientProfileResponse
 from app.schemas.appointment import AppointmentResponse
 
+from datetime import datetime
+
 class DoctorCreateByAdmin(BaseModel):
     email: EmailStr
     password: str
@@ -15,6 +17,20 @@ class DoctorCreateByAdmin(BaseModel):
     consultation_fee: float = 500.0
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
+
+class AdminPatientResponse(BaseModel):
+    id: int
+    user_id: int
+    full_name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    blood_group: Optional[str] = None
+    uhid: str
+    city: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
 
 class PlatformStatsResponse(BaseModel):
     total_patients: int

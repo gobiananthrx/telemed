@@ -472,8 +472,60 @@ async def run_tests():
         assert res_verify_del.status_code == 404
         print("✅ Verified deleted doctor no longer exists in system")
 
+        # 15. Admin Patient List & Deletion
+        print("\n[TEST 15] Testing Admin Patient List & Deletion...")
+        res_admin_patients = await client.get("/api/admin/patients", headers=headers_admin)
+        assert res_admin_patients.status_code == 200, f"Admin patient list failed: {res_admin_patients.text}"
+        admin_patients_list = res_admin_patients.json()
+        assert isinstance(admin_patients_list, list)
+        assert any(p["id"] == patient_profile_id for p in admin_patients_list), "Registered patient must appear in admin patient list"
+        print(f"✅ Admin successfully listed {len(admin_patients_list)} patients")
+
+        # Create temporary patient to test deletion
+        temp_pat_email = f"pat.temp.{unique_num}@telemed.com"
+        res_temp_pat = await client.post("/api/auth/register", json={
+            "email": temp_pat_email,
+            "password": "TempPassword123!",
+            "confirm_password": "TempPassword123!",
+            "full_name": f"Temp Patient {unique_num}",
+            "phone_number": f"+91987{unique_num % 1000000:07d}",
+            "gender": "Other",
+            "date_of_birth": "1998-05-12",
+            "blood_group": "B+",
+            "city": "Chennai"
+        })
+        assert res_temp_pat.status_code in (200, 201)
+        # Fetch patient profile ID from DB
+        async with AsyncSessionLocal() as db_session:
+            from app.models.patient import PatientProfile
+            from app.models.user import User
+            temp_user = (await db_session.execute(select(User).where(User.email == temp_pat_email))).scalar_one()
+            temp_profile = (await db_session.execute(select(PatientProfile).where(PatientProfile.user_id == temp_user.id))).scalar_one()
+            temp_pat_profile_id = temp_profile.id
+
+        # Delete patient
+        res_del_pat = await client.delete(f"/api/admin/patients/{temp_pat_profile_id}", headers=headers_admin)
+        assert res_del_pat.status_code == 200, f"Patient deletion failed: {res_del_pat.text}"
+        print(f"✅ Admin deleted patient ID {temp_pat_profile_id}")
+
+        # 16. Dynamic Slot Creation Without End Time
+        print("\n[TEST 16] Testing Dynamic Slot Creation without End Time...")
+        dynamic_slot_date = (datetime.now().date() + timedelta(days=5)).isoformat()
+        res_dyn_slot = await client.post("/api/doctors/me/slots", json={
+            "date": dynamic_slot_date,
+            "start_time": "20:00",
+            "duration_minutes": 30
+        }, headers=headers_doc)
+        assert res_dyn_slot.status_code == 200, f"Dynamic slot creation failed: {res_dyn_slot.text}"
+        dyn_slots = res_dyn_slot.json() if isinstance(res_dyn_slot.json(), list) else res_dyn_slot.json().get("slots", [])
+        assert len(dyn_slots) >= 1
+        created_slot = dyn_slots[0]
+        assert created_slot["start_time"].startswith("20:00")
+        assert created_slot["end_time"].startswith("20:30")
+        print(f"✅ Dynamic slot created: {created_slot['start_time'][:5]} -> {created_slot['end_time'][:5]} (30 mins duration)")
+
     print("\n" + "=" * 65)
-    print("🎉 ALL 14 COMPREHENSIVE END-TO-END VERIFICATION TESTS PASSED 100%!")
+    print("🎉 ALL 16 COMPREHENSIVE END-TO-END VERIFICATION TESTS PASSED 100%!")
     print("=" * 65)
 
 if __name__ == "__main__":

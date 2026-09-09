@@ -2,10 +2,126 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import {
   ChevronLeft, Video, VideoOff, Mic, MicOff, PhoneOff,
-  ShieldCheck, AlertCircle, RefreshCw
+  ShieldCheck, AlertCircle, RefreshCw, Volume2
 } from 'lucide-react';
 import { apiClient } from '../../api/client';
 import { useAuth } from '../../context/AuthContext';
+
+// Helper: Generate simulated video track for environments where camera is unavailable
+const createSimulatedVideoTrack = (isDoctor, userName) => {
+  const canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 480;
+  const ctx = canvas.getContext('2d');
+  const hue = isDoctor ? 175 : 210;
+
+  const intervalId = setInterval(() => {
+    ctx.fillStyle = `hsl(${hue}, 40%, 15%)`;
+    ctx.fillRect(0, 0, 640, 480);
+
+    ctx.strokeStyle = `hsl(${hue}, 80%, 40%)`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(320, 220, 75 + Math.sin(Date.now() / 250) * 8, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 22px Plus Jakarta Sans, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(userName || (isDoctor ? 'Doctor Feed' : 'Patient Feed'), 320, 225);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.font = '13px Plus Jakarta Sans, sans-serif';
+    ctx.fillText('Live Two-Way Encrypted Telemed Video', 320, 260);
+    ctx.fillText(new Date().toLocaleTimeString(), 320, 285);
+  }, 1000 / 30);
+
+  const stream = canvas.captureStream(30);
+  const track = stream.getVideoTracks()[0];
+  if (track) {
+    track._intervalId = intervalId;
+  }
+  return track;
+};
+
+// Helper: Generate simulated audio track for environments where microphone is unavailable
+const createSimulatedAudioTrack = () => {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return null;
+    const ctx = new AudioContextClass();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    gain.gain.value = 0.001; // subtle live frequency to keep audio pipe open
+    const dst = ctx.createMediaStreamDestination();
+    osc.connect(gain);
+    gain.connect(dst);
+    osc.start();
+    const track = dst.stream.getAudioTracks()[0];
+    if (track) {
+      track._audioCtx = ctx;
+    }
+    return track;
+  } catch (e) {
+    console.warn('Simulated audio track creation skipped:', e);
+    return null;
+  }
+};
+
+// Robust Media Stream Acquisition
+const acquireMediaStream = async (isDoctor, userName) => {
+  // 1. Try real HD camera + real microphone
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280, min: 640 }, height: { ideal: 720, min: 480 } },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    console.log('[Media] Acquired real HD camera and microphone');
+    return stream;
+  } catch (e1) {
+    console.warn('[Media] HD camera/mic failed, trying standard media:', e1.message);
+  }
+
+  // 2. Try standard camera + microphone
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    console.log('[Media] Acquired real standard camera and microphone');
+    return stream;
+  } catch (e2) {
+    console.warn('[Media] Standard camera/mic failed, checking single media device:', e2.message);
+  }
+
+  // 3. Try microphone only (with simulated video avatar)
+  try {
+    const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const videoTrack = createSimulatedVideoTrack(isDoctor, userName);
+    if (videoTrack) audioStream.addTrack(videoTrack);
+    console.log('[Media] Acquired real microphone with simulated video avatar');
+    return audioStream;
+  } catch (e3) {
+    console.warn('[Media] Audio-only failed:', e3.message);
+  }
+
+  // 4. Try camera only (with simulated audio track)
+  try {
+    const videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
+    const audioTrack = createSimulatedAudioTrack();
+    if (audioTrack) videoStream.addTrack(audioTrack);
+    console.log('[Media] Acquired real camera with simulated audio track');
+    return videoStream;
+  } catch (e4) {
+    console.warn('[Media] Video-only failed:', e4.message);
+  }
+
+  // 5. Hardware unavailable / Headless testing fallback
+  console.log('[Media] Hardware unavailable, using simulated video+audio stream');
+  const simStream = new MediaStream();
+  const simVideo = createSimulatedVideoTrack(isDoctor, userName);
+  if (simVideo) simStream.addTrack(simVideo);
+  const simAudio = createSimulatedAudioTrack();
+  if (simAudio) simStream.addTrack(simAudio);
+  return simStream;
+};
 
 export const VideoConsultation = () => {
   const { roomId } = useParams();
@@ -18,271 +134,344 @@ export const VideoConsultation = () => {
   const [cameraActive, setCameraActive] = useState(true);
   const [micActive, setMicActive] = useState(true);
   const [errorNotice, setErrorNotice] = useState(null);
+  const [autoplayBlocked, setAutoplayBlocked] = useState(false);
 
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const wsRef = useRef(null);
   const localStreamRef = useRef(null);
-  const canvasStreamIntervalRef = useRef(null);
-  const audioContextRef = useRef(null);
+  const remoteStreamRef = useRef(null);
+  const iceCandidatesQueue = useRef([]);
+  const isNegotiating = useRef(false);
 
   const peerId = useRef(`peer-${user?.id || Math.floor(Math.random() * 10000)}`).current;
   const isDoctor = user?.role === 'DOCTOR';
 
-  // 1. Fetch Consultation Details & Authorize
+  // 1. Fetch Consultation Details & Authorize on Backend
   useEffect(() => {
+    let active = true;
     const loadConsultation = async () => {
       try {
         const data = await apiClient(`/consultations/${roomId}`);
+        if (!active) return;
         setConsultation(data);
 
         // Record join on backend
         await apiClient(`/consultations/${roomId}/join`, { method: 'POST' });
       } catch (err) {
         console.error('Error loading consultation:', err);
-        setErrorNotice(err.message || 'Failed to initialize consultation session.');
+        if (active) {
+          setErrorNotice(err.message || 'Failed to initialize consultation session.');
+        }
       }
     };
 
     if (roomId) loadConsultation();
+    return () => { active = false; };
   }, [roomId]);
 
-  // 2. Initialize Two-Way Video + Audio Stream
+  // 2. Real-Time Two-Way Video + Audio WebRTC Pipeline
   useEffect(() => {
-    let mounted = true;
+    let isMounted = true;
+    let localStream = null;
+    let pc = null;
+    let ws = null;
 
-    const startLocalStream = async () => {
+    const startCall = async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: 'user',
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-          audio: true, // TWO-WAY VIDEO + AUDIO
+        // Step A: Acquire local media stream (camera + mic)
+        localStream = await acquireMediaStream(isDoctor, user?.name);
+        if (!isMounted) {
+          localStream.getTracks().forEach(t => t.stop());
+          return;
+        }
+
+        localStreamRef.current = localStream;
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = localStream;
+          localVideoRef.current.play().catch(() => {});
+        }
+
+        // Step B: Initialize WebRTC PeerConnection with STUN servers
+        const pcConfig = {
+          iceServers: [
+            { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+            { urls: ['stun:stun.cloudflare.com:3478'] },
+          ],
+          iceCandidatePoolSize: 10,
+        };
+
+        pc = new RTCPeerConnection(pcConfig);
+        peerConnectionRef.current = pc;
+
+        // Immediately attach local audio & video tracks so all offers/answers include them
+        localStream.getTracks().forEach((track) => {
+          console.log('[WebRTC] Adding local track to PeerConnection:', track.kind, track.label);
+          pc.addTrack(track, localStream);
         });
 
-        if (!mounted) return;
-        localStreamRef.current = stream;
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-        }
-      } catch (err) {
-        console.warn('Physical camera/mic unavailable or permission denied, initializing clinical video+audio simulation:', err.message);
-
-        // Simulated video stream via canvas
-        const canvas = document.createElement('canvas');
-        canvas.width = 640;
-        canvas.height = 480;
-        const ctx = canvas.getContext('2d');
-
-        const hue = isDoctor ? 175 : 210;
-        canvasStreamIntervalRef.current = setInterval(() => {
-          if (!mounted) return;
-          ctx.fillStyle = `hsl(${hue}, 40%, 15%)`;
-          ctx.fillRect(0, 0, 640, 480);
-
-          ctx.strokeStyle = `hsl(${hue}, 80%, 40%)`;
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.arc(320, 220, 75 + Math.sin(Date.now() / 300) * 5, 0, Math.PI * 2);
-          ctx.stroke();
-
-          ctx.fillStyle = '#ffffff';
-          ctx.font = 'bold 22px Plus Jakarta Sans, sans-serif';
-          ctx.textAlign = 'center';
-          ctx.fillText(user?.name || (isDoctor ? 'Dr. Provider' : 'Patient Feed'), 320, 225);
-
-          ctx.fillStyle = 'rgba(255,255,255,0.7)';
-          ctx.font = '13px Plus Jakarta Sans, sans-serif';
-          ctx.fillText('Secure Telemed Two-Way Consultation', 320, 260);
-          ctx.fillText('Mode: Video + Audio • HD 720p', 320, 285);
-        }, 50);
-
-        const simStream = canvas.captureStream(30);
-
-        // Simulated audio track via Web Audio API
-        try {
-          const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-          if (AudioContextClass) {
-            const audioCtx = new AudioContextClass();
-            audioContextRef.current = audioCtx;
-            const osc = audioCtx.createOscillator();
-            const gain = audioCtx.createGain();
-            gain.gain.value = 0.001; // virtually silent tone to preserve live audio track
-            const dst = audioCtx.createMediaStreamDestination();
-            osc.connect(gain);
-            gain.connect(dst);
-            osc.start();
-
-            const audioTrack = dst.stream.getAudioTracks()[0];
-            if (audioTrack) {
-              simStream.addTrack(audioTrack);
-            }
+        // Remote track handler: attach remote audio + video to remote video element
+        pc.ontrack = (event) => {
+          console.log('[WebRTC] Received remote stream track:', event.track.kind);
+          if (!remoteStreamRef.current) {
+            remoteStreamRef.current = new MediaStream();
           }
-        } catch (audioErr) {
-          console.warn('Audio simulation skipped:', audioErr);
-        }
 
-        localStreamRef.current = simStream;
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = simStream;
-        }
-      }
-    };
+          if (event.streams && event.streams[0]) {
+            remoteStreamRef.current = event.streams[0];
+          } else {
+            remoteStreamRef.current.addTrack(event.track);
+          }
 
-    startLocalStream();
-
-    return () => {
-      mounted = false;
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t) => t.stop());
-      }
-      if (canvasStreamIntervalRef.current) {
-        clearInterval(canvasStreamIntervalRef.current);
-      }
-      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close().catch(() => {});
-      }
-    };
-  }, [isDoctor, user]);
-
-  // 3. WebSocket Signaling & WebRTC PeerConnection
-  useEffect(() => {
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsHost = window.location.host;
-    const token = localStorage.getItem('token');
-    const wsUrl = `${wsProtocol}//${wsHost}/ws/consultation/${roomId}?peer_id=${peerId}&role=${user?.role || 'PATIENT'}&name=${encodeURIComponent(user?.name || 'Participant')}${token ? `&token=${token}` : ''}`;
-
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-
-    const pcConfig = {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ],
-    };
-
-    const pc = new RTCPeerConnection(pcConfig);
-    peerConnectionRef.current = pc;
-
-    // Attach local video & audio tracks
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current);
-      });
-    }
-
-    // Handle incoming remote stream tracks
-    pc.ontrack = (event) => {
-      console.log('[WebRTC] Received remote stream track:', event.track.kind);
-      if (remoteVideoRef.current && event.streams[0]) {
-        remoteVideoRef.current.srcObject = event.streams[0];
-        setConnectionStatus('ACTIVE');
-        setStatusMessage('Connected');
-      }
-    };
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'ice-candidate',
-          candidate: event.candidate,
-        }));
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      console.log('[WebRTC] State changed:', pc.connectionState);
-      if (pc.connectionState === 'connected') {
-        setConnectionStatus('ACTIVE');
-        setStatusMessage('Encrypted Connection Established');
-      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-        setConnectionStatus('RECONNECTING');
-        setStatusMessage('Reconnecting consultation link...');
-      }
-    };
-
-    // Signaling messages
-    ws.onmessage = async (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        console.log('[Signaling] Inbound:', msg.type);
-
-        switch (msg.type) {
-          case 'room-state':
-            if (msg.peers.length > 0) {
-              setConnectionStatus('CONNECTING');
-              setStatusMessage('Peer present. Negotiating WebRTC session...');
+          if (remoteVideoRef.current) {
+            if (remoteVideoRef.current.srcObject !== remoteStreamRef.current) {
+              remoteVideoRef.current.srcObject = remoteStreamRef.current;
             }
-            break;
+            remoteVideoRef.current.play().catch((err) => {
+              console.warn('[WebRTC] Remote play prevented by browser autoplay policy:', err);
+              if (isMounted) setAutoplayBlocked(true);
+            });
+          }
 
-          case 'peer-joined':
-            setStatusMessage(`${msg.name} joined. Initializing consultation...`);
-            setConnectionStatus('CONNECTING');
-
-            if (isDoctor) {
-              const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: true });
-              await pc.setLocalDescription(offer);
-              ws.send(JSON.stringify({ type: 'offer', sdp: offer }));
-            }
-            break;
-
-          case 'ready-for-negotiation':
-            if (isDoctor) {
-              const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: true });
-              await pc.setLocalDescription(offer);
-              ws.send(JSON.stringify({ type: 'offer', sdp: offer }));
-            }
-            break;
-
-          case 'offer':
-            console.log('[WebRTC] Handling offer');
-            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-            const answer = await pc.createAnswer({ offerToReceiveVideo: true, offerToReceiveAudio: true });
-            await pc.setLocalDescription(answer);
-            ws.send(JSON.stringify({ type: 'answer', sdp: answer }));
+          if (isMounted) {
             setConnectionStatus('ACTIVE');
-            break;
+            setStatusMessage('Live Video & Audio Connected');
+          }
+        };
 
-          case 'answer':
-            console.log('[WebRTC] Handling answer');
-            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        pc.onicecandidate = (event) => {
+          if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'ice-candidate',
+              candidate: event.candidate.toJSON ? event.candidate.toJSON() : event.candidate,
+            }));
+          }
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          console.log('[WebRTC] ICE Connection State:', pc.iceConnectionState);
+          if (!isMounted) return;
+          if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
             setConnectionStatus('ACTIVE');
-            break;
+            setStatusMessage('Live Video & Audio Connected');
+          } else if (pc.iceConnectionState === 'failed') {
+            console.warn('[WebRTC] ICE Connection failed, restarting ICE...');
+            setConnectionStatus('RECONNECTING');
+            setStatusMessage('Reconnecting consultation link...');
+            if (pc.restartIce) pc.restartIce();
+          } else if (pc.iceConnectionState === 'disconnected') {
+            setConnectionStatus('RECONNECTING');
+            setStatusMessage('Connection interrupted. Reconnecting...');
+          }
+        };
 
-          case 'ice-candidate':
-            if (msg.candidate) {
-              await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        pc.onconnectionstatechange = () => {
+          console.log('[WebRTC] Peer Connection State:', pc.connectionState);
+          if (!isMounted) return;
+          if (pc.connectionState === 'connected') {
+            setConnectionStatus('ACTIVE');
+            setStatusMessage('Encrypted Connection Established');
+          } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+            setConnectionStatus('RECONNECTING');
+            setStatusMessage('Reconnecting consultation link...');
+          }
+        };
+
+        // Step C: Connect WebSocket Signaling
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsHost = window.location.host;
+        const token = localStorage.getItem('token');
+        const wsUrl = `${wsProtocol}//${wsHost}/ws/consultation/${roomId}?peer_id=${peerId}&role=${user?.role || 'PATIENT'}&name=${encodeURIComponent(user?.name || 'Participant')}${token ? `&token=${token}` : ''}`;
+
+        ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
+
+        const sendOfferIfDoctor = async () => {
+          if (!isDoctor) return;
+          if (isNegotiating.current) return;
+          if (!pc || pc.signalingState !== 'stable') {
+            console.log('[WebRTC] Skipping offer creation, state:', pc?.signalingState);
+            return;
+          }
+
+          try {
+            isNegotiating.current = true;
+            console.log('[WebRTC] Doctor creating and sending offer...');
+            const offer = await pc.createOffer({
+              offerToReceiveAudio: true,
+              offerToReceiveVideo: true,
+            });
+            await pc.setLocalDescription(offer);
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: 'offer',
+                sdp: pc.localDescription || offer,
+              }));
             }
-            break;
+          } catch (err) {
+            console.error('[WebRTC] Error creating offer:', err);
+          } finally {
+            isNegotiating.current = false;
+          }
+        };
 
-          case 'call-ended':
-            setConnectionStatus('ENDED');
-            setStatusMessage('The consultation has concluded.');
-            break;
+        ws.onopen = () => {
+          console.log('[Signaling] WebSocket connected to consultation room:', roomId);
+        };
 
-          case 'peer-left':
-            setStatusMessage(`${msg.name} left the room.`);
-            setConnectionStatus('WAITING');
-            break;
+        ws.onmessage = async (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            console.log('[Signaling] Inbound message:', msg.type);
 
-          case 'error':
-            setErrorNotice(msg.message || 'Signaling error occurred.');
-            break;
+            switch (msg.type) {
+              case 'room-state':
+                if (msg.peers && msg.peers.length > 0) {
+                  if (isMounted) {
+                    setConnectionStatus('CONNECTING');
+                    setStatusMessage('Participant present in room...');
+                  }
+                  await sendOfferIfDoctor();
+                }
+                break;
 
-          default:
-            break;
-        }
+              case 'peer-joined':
+                if (isMounted) {
+                  setStatusMessage(`${msg.name} joined. Connecting video & audio...`);
+                  setConnectionStatus('CONNECTING');
+                }
+                await sendOfferIfDoctor();
+                break;
+
+              case 'ready-for-negotiation':
+                if (isMounted) {
+                  setStatusMessage('Both parties present. Negotiating real-time media...');
+                  setConnectionStatus('CONNECTING');
+                }
+                await sendOfferIfDoctor();
+                break;
+
+              case 'offer':
+                console.log('[WebRTC] Received offer, setting remote description...');
+                if (pc.signalingState !== 'stable') {
+                  await Promise.all([
+                    pc.setLocalDescription({ type: 'rollback' }).catch(() => {}),
+                    pc.setRemoteDescription(new RTCSessionDescription(msg.sdp))
+                  ]);
+                } else {
+                  await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                }
+
+                // Drain queued ICE candidates
+                while (iceCandidatesQueue.current.length > 0) {
+                  const cand = iceCandidatesQueue.current.shift();
+                  await pc.addIceCandidate(cand).catch(e => console.warn('ICE drain error:', e));
+                }
+
+                // Create and send answer
+                const answer = await pc.createAnswer({
+                  offerToReceiveAudio: true,
+                  offerToReceiveVideo: true,
+                });
+                await pc.setLocalDescription(answer);
+
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: 'answer',
+                    sdp: pc.localDescription || answer,
+                  }));
+                }
+
+                if (isMounted) {
+                  setConnectionStatus('ACTIVE');
+                  setStatusMessage('Live Video & Audio Connected');
+                }
+                break;
+
+              case 'answer':
+                console.log('[WebRTC] Received answer, setting remote description...');
+                if (pc.signalingState === 'have-local-offer') {
+                  await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                  while (iceCandidatesQueue.current.length > 0) {
+                    const cand = iceCandidatesQueue.current.shift();
+                    await pc.addIceCandidate(cand).catch(e => console.warn('ICE drain error:', e));
+                  }
+                  if (isMounted) {
+                    setConnectionStatus('ACTIVE');
+                    setStatusMessage('Live Video & Audio Connected');
+                  }
+                }
+                break;
+
+              case 'ice-candidate':
+                if (msg.candidate) {
+                  const cand = new RTCIceCandidate(msg.candidate);
+                  if (pc && pc.remoteDescription && pc.remoteDescription.type) {
+                    await pc.addIceCandidate(cand).catch(e => console.warn('ICE add error:', e));
+                  } else {
+                    iceCandidatesQueue.current.push(cand);
+                  }
+                }
+                break;
+
+              case 'call-ended':
+                if (isMounted) {
+                  setConnectionStatus('ENDED');
+                  setStatusMessage('The consultation has concluded.');
+                }
+                break;
+
+              case 'peer-left':
+                if (isMounted) {
+                  setStatusMessage(`${msg.name} disconnected.`);
+                  setConnectionStatus('WAITING');
+                }
+                break;
+
+              case 'error':
+                if (isMounted) {
+                  setErrorNotice(msg.message || 'Signaling error occurred.');
+                }
+                break;
+
+              default:
+                break;
+            }
+          } catch (err) {
+            console.error('[Signaling] Message handler error:', err);
+          }
+        };
+
+        ws.onerror = (err) => {
+          console.error('[Signaling] WebSocket error:', err);
+        };
+
+        ws.onclose = () => {
+          console.log('[Signaling] WebSocket connection closed');
+        };
+
       } catch (err) {
-        console.error('[Signaling] Message error:', err);
+        console.error('[WebRTC] Call setup error:', err);
+        if (isMounted) {
+          setErrorNotice('Unable to initialize video & audio communication. Please ensure camera/microphone permissions are granted.');
+        }
       }
     };
 
+    startCall();
+
     return () => {
-      if (ws.readyState === WebSocket.OPEN) {
+      isMounted = false;
+      if (localStream) {
+        localStream.getTracks().forEach((t) => {
+          t.stop();
+          if (t._intervalId) clearInterval(t._intervalId);
+          if (t._audioCtx && t._audioCtx.state !== 'closed') t._audioCtx.close().catch(() => {});
+        });
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) {
         ws.close();
       }
       if (pc) {
@@ -393,6 +582,27 @@ export const VideoConsultation = () => {
       <main className="flex-1 relative w-full overflow-hidden bg-black flex items-center justify-center p-2 sm:p-4 md:p-6">
         <div className="relative w-full h-full max-w-6xl max-h-[85vh] rounded-2xl md:rounded-3xl overflow-hidden bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center">
           
+          {/* Audio Autoplay Permission Prompt */}
+          {autoplayBlocked && (
+            <div className="absolute top-6 z-30 flex items-center gap-3 px-4 py-2.5 rounded-2xl bg-teal-600 text-white shadow-xl border border-teal-400">
+              <Volume2 className="w-5 h-5 animate-bounce" />
+              <span className="text-xs font-semibold">Audio playback needs browser permission</span>
+              <button
+                type="button"
+                onClick={() => {
+                  if (remoteVideoRef.current) {
+                    remoteVideoRef.current.play()
+                      .then(() => setAutoplayBlocked(false))
+                      .catch(e => console.error('Play retry error:', e));
+                  }
+                }}
+                className="bg-white text-teal-800 text-xs font-bold px-3 py-1 rounded-xl shadow-xs cursor-pointer hover:bg-teal-50 transition"
+              >
+                Click to Hear Audio
+              </button>
+            </div>
+          )}
+
           {/* Main Remote Video */}
           <video
             ref={remoteVideoRef}

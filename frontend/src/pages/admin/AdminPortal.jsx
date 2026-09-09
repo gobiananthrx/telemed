@@ -39,6 +39,7 @@ export const AdminPortal = () => {
   // Admin Data States
   const [stats, setStats] = useState(null);
   const [doctors, setDoctors] = useState([]);
+  const [patients, setPatients] = useState([]);
   const [appointments, setAppointments] = useState([]);
   const [prescriptions, setPrescriptions] = useState([]);
   const [doctorSlots, setDoctorSlots] = useState([]);
@@ -62,11 +63,36 @@ export const AdminPortal = () => {
     avatar_url: '',
   });
 
-  // Doctor Slot Creator State
+  // Calculate dynamic slot end time
+  const calculateEndTime = (startTime, durationMinutes) => {
+    if (!startTime) return '';
+    const parts = startTime.split(':');
+    if (parts.length < 2) return '';
+    const h = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    if (isNaN(h) || isNaN(m)) return '';
+    const totalMinutes = h * 60 + m + parseInt(durationMinutes || 30, 10);
+    const endH = Math.floor((totalMinutes % (24 * 60)) / 60);
+    const endM = totalMinutes % 60;
+    return `${String(endH).padStart(2, '0')}:${String(endM).padStart(2, '0')}`;
+  };
+
+  const formatTime12h = (timeStr) => {
+    if (!timeStr) return '';
+    const parts = timeStr.split(':');
+    if (parts.length < 2) return timeStr;
+    let h = parseInt(parts[0], 10);
+    const m = parts[1];
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    h = h % 12;
+    if (h === 0) h = 12;
+    return `${h}:${m} ${ampm}`;
+  };
+
+  // Doctor Slot Creator State (End time dynamically calculated)
   const [slotForm, setSlotForm] = useState({
     date: '',
     start_time: '09:00',
-    end_time: '13:00',
     duration_minutes: 30,
   });
   const [slotSubmitting, setSlotSubmitting] = useState(false);
@@ -119,15 +145,17 @@ export const AdminPortal = () => {
 
     try {
       if (isAdmin) {
-        const [statsData, docData, apptData] = await Promise.allSettled([
+        const [statsData, docData, apptData, patData] = await Promise.allSettled([
           apiClient('/admin/stats'),
           apiClient('/admin/doctors'),
           apiClient('/appointments'),
+          apiClient('/admin/patients'),
         ]);
 
         if (statsData.status === 'fulfilled') setStats(statsData.value);
         if (docData.status === 'fulfilled') setDoctors(docData.value || []);
         if (apptData.status === 'fulfilled') setAppointments(apptData.value || []);
+        if (patData.status === 'fulfilled') setPatients(patData.value || []);
       } else if (isDoctor) {
         const [apptData, patData, rxData, slotsData] = await Promise.allSettled([
           apiClient('/appointments'),
@@ -251,21 +279,38 @@ export const AdminPortal = () => {
     }
   };
 
-  // Doctor Slot Batch Creation
+  // Delete Patient by Admin
+  const handleDeletePatient = async (patientId, patientName) => {
+    if (!window.confirm(`Are you sure you want to delete patient ${patientName}? This will permanently delete the patient's profile, user account, and related records.`)) {
+      return;
+    }
+
+    try {
+      await apiClient(`/admin/patients/${patientId}`, { method: 'DELETE' });
+      alert(`Patient ${patientName} has been deleted successfully.`);
+      loadPortalData();
+    } catch (err) {
+      alert(err.message || 'Failed to delete patient.');
+    }
+  };
+
+  // Doctor Slot Batch Creation (End time dynamically calculated from duration)
   const handleCreateSlots = async (e) => {
     e.preventDefault();
     setSlotSubmitting(true);
     try {
+      const computedEndTime = calculateEndTime(slotForm.start_time, slotForm.duration_minutes);
       const res = await apiClient('/doctors/me/slots', {
         method: 'POST',
         body: JSON.stringify({
           date: slotForm.date,
           start_time: slotForm.start_time,
-          end_time: slotForm.end_time,
-          duration_minutes: parseInt(slotForm.duration_minutes),
+          end_time: computedEndTime,
+          duration_minutes: parseInt(slotForm.duration_minutes, 10),
+          slot_duration_minutes: parseInt(slotForm.duration_minutes, 10),
         }),
       });
-      alert(res.message || 'Slots created successfully!');
+      alert(res.message || 'Slot created successfully!');
       setSlotForm(prev => ({ ...prev, date: '' }));
       loadPortalData();
     } catch (err) {
@@ -458,6 +503,18 @@ export const AdminPortal = () => {
               >
                 <UserCheck className="w-4 h-4" />
                 <span>Doctors Directory</span>
+              </button>
+            )}
+
+            {isAdmin && (
+              <button
+                onClick={() => setActiveTab('ADMIN_PATIENTS')}
+                className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl transition cursor-pointer ${
+                  activeTab === 'ADMIN_PATIENTS' ? 'bg-teal-700 text-white shadow-sm font-bold' : 'text-slate-600 hover:bg-slate-50'
+                }`}
+              >
+                <Users className="w-4 h-4" />
+                <span>Patients Directory</span>
               </button>
             )}
 
@@ -707,6 +764,72 @@ export const AdminPortal = () => {
           </div>
         )}
 
+        {/* Tab: ADMIN_PATIENTS (Admin only - Patient Directory & Deletion) */}
+        {activeTab === 'ADMIN_PATIENTS' && isAdmin && (
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-subtle overflow-hidden">
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-bold text-slate-900">Registered Platform Patients ({patients.length})</h2>
+                <span className="text-xs text-slate-400">All registered patient accounts and clinical profiles</span>
+              </div>
+            </div>
+
+            {patients.length === 0 ? (
+              <div className="text-center py-16 text-slate-400">
+                <Users className="w-12 h-12 mx-auto mb-3 text-slate-300 stroke-1" />
+                <p className="font-semibold text-sm text-slate-700">No patients registered yet</p>
+                <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
+                  Patients will appear here as they register on the platform.
+                </p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 text-slate-500 font-bold uppercase text-[10px] tracking-wider border-b border-slate-100">
+                    <tr>
+                      <th className="p-3.5">UHID</th>
+                      <th className="p-3.5">Patient Name</th>
+                      <th className="p-3.5">Contact Details</th>
+                      <th className="p-3.5">Location &amp; Blood</th>
+                      <th className="p-3.5">Registered On</th>
+                      <th className="p-3.5 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {patients.map((pat) => (
+                      <tr key={pat.id} className="hover:bg-slate-50/80">
+                        <td className="p-3.5 font-mono font-bold text-teal-700">{pat.uhid}</td>
+                        <td className="p-3.5 font-bold text-slate-900">{pat.full_name}</td>
+                        <td className="p-3.5 text-slate-600">
+                          <p className="font-semibold text-slate-700">{pat.email || 'No email'}</p>
+                          <p className="text-[11px] text-slate-400">{pat.phone || 'No phone'}</p>
+                        </td>
+                        <td className="p-3.5 text-slate-600">
+                          <p>{pat.city || 'Not specified'}</p>
+                          <p className="text-[11px] font-semibold text-teal-700">Blood: {pat.blood_group || 'N/A'}</p>
+                        </td>
+                        <td className="p-3.5 text-slate-500">
+                          {pat.created_at ? new Date(pat.created_at).toLocaleDateString() : 'N/A'}
+                        </td>
+                        <td className="p-3.5 text-right">
+                          <button
+                            type="button"
+                            onClick={() => handleDeletePatient(pat.id, pat.full_name)}
+                            title="Delete Patient"
+                            className="p-2 rounded-xl text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition cursor-pointer"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Tab: APPOINTMENTS (Admin & Doctor View) */}
         {activeTab === 'APPOINTMENTS' && (
           <div className="bg-white rounded-2xl border border-slate-200 shadow-subtle overflow-hidden">
@@ -715,6 +838,40 @@ export const AdminPortal = () => {
                 {isAdmin ? 'All Platform Appointments' : 'My Scheduled Consultations'} ({appointments.length})
               </h2>
             </div>
+
+            {/* Doctor Quick Next Consultation Banner */}
+            {isDoctor && appointments.find(a => a.status !== 'COMPLETED' && a.status !== 'MISSED') && (() => {
+              const nextAppt = appointments.find(a => a.status !== 'COMPLETED' && a.status !== 'MISSED');
+              return (
+                <div className="m-5 p-4 bg-teal-50 border border-teal-200 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-teal-700 flex items-center justify-center text-white shadow-xs shrink-0">
+                      <Video className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-bold uppercase tracking-wider bg-teal-200/70 text-teal-900 px-2 py-0.5 rounded-md">
+                          Scheduled Consultation
+                        </span>
+                        <span className="text-xs font-mono font-bold text-teal-800">{nextAppt.appointment_number}</span>
+                      </div>
+                      <p className="text-xs font-bold text-slate-900 mt-1">
+                        Patient: {nextAppt.patient?.full_name || 'Patient'} • {nextAppt.date} at {nextAppt.start_time?.slice(0, 5)}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={startingConsultationId === nextAppt.id}
+                    onClick={() => nextAppt.room_id ? navigate(`/consultation/${nextAppt.room_id}`) : handleStartConsultation(nextAppt.id)}
+                    className="bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white font-bold text-xs px-4 py-2.5 rounded-xl shadow-xs inline-flex items-center justify-center gap-2 cursor-pointer whitespace-nowrap"
+                  >
+                    <Video className="w-4 h-4" />
+                    <span>{startingConsultationId === nextAppt.id ? 'Connecting...' : 'Join Consultation'}</span>
+                  </button>
+                </div>
+              );
+            })()}
 
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs">
@@ -758,15 +915,26 @@ export const AdminPortal = () => {
                         <td className="p-3.5 text-right">
                           <div className="flex items-center justify-end gap-2">
                             {isDoctor && appt.status !== 'COMPLETED' && appt.status !== 'MISSED' && (
-                              <button
-                                type="button"
-                                disabled={startingConsultationId === appt.id}
-                                onClick={() => handleStartConsultation(appt.id)}
-                                className="bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white px-3 py-1.5 rounded-xl font-bold text-[11px] inline-flex items-center gap-1.5 cursor-pointer shadow-xs"
-                              >
-                                <Video className="w-3.5 h-3.5" />
-                                <span>{startingConsultationId === appt.id ? 'Starting...' : 'Start Consultation'}</span>
-                              </button>
+                              appt.room_id ? (
+                                <button
+                                  type="button"
+                                  onClick={() => navigate(`/consultation/${appt.room_id}`)}
+                                  className="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-xl font-bold text-[11px] inline-flex items-center gap-1.5 cursor-pointer shadow-xs"
+                                >
+                                  <Video className="w-3.5 h-3.5" />
+                                  <span>Join Consultation</span>
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  disabled={startingConsultationId === appt.id}
+                                  onClick={() => handleStartConsultation(appt.id)}
+                                  className="bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white px-3 py-1.5 rounded-xl font-bold text-[11px] inline-flex items-center gap-1.5 cursor-pointer shadow-xs"
+                                >
+                                  <Video className="w-3.5 h-3.5" />
+                                  <span>{startingConsultationId === appt.id ? 'Connecting...' : 'Join Consultation'}</span>
+                                </button>
+                              )
                             )}
                             {isDoctor && (
                               <button
@@ -806,7 +974,7 @@ export const AdminPortal = () => {
               <div>
                 <h2 className="text-base font-bold text-slate-900">Generate Consultation Slots</h2>
                 <p className="text-xs text-slate-500">
-                  Configure your working hours for any date. Slots are partitioned based on your selected duration. Conflicting or past intervals are automatically rejected.
+                  Select your slot date, start time, and duration. The slot end time is calculated automatically based on your chosen duration.
                 </p>
               </div>
 
@@ -819,7 +987,7 @@ export const AdminPortal = () => {
                     min={new Date().toISOString().split('T')[0]}
                     value={slotForm.date}
                     onChange={(e) => setSlotForm({ ...slotForm, date: e.target.value })}
-                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold"
+                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800"
                   />
                 </div>
 
@@ -830,43 +998,38 @@ export const AdminPortal = () => {
                     required
                     value={slotForm.start_time}
                     onChange={(e) => setSlotForm({ ...slotForm, start_time: e.target.value })}
-                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold"
-                  />
-                </div>
-
-                <div>
-                  <label className="font-bold text-slate-700 block mb-1.5">End Time</label>
-                  <input
-                    type="time"
-                    required
-                    value={slotForm.end_time}
-                    onChange={(e) => setSlotForm({ ...slotForm, end_time: e.target.value })}
-                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold"
+                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800"
                   />
                 </div>
 
                 <div>
                   <label className="font-bold text-slate-700 block mb-1.5">Duration</label>
-                  <div className="flex gap-2">
-                    <select
-                      value={slotForm.duration_minutes}
-                      onChange={(e) => setSlotForm({ ...slotForm, duration_minutes: e.target.value })}
-                      className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold"
-                    >
-                      <option value="15">15 Minutes</option>
-                      <option value="30">30 Minutes</option>
-                      <option value="45">45 Minutes</option>
-                      <option value="60">60 Minutes</option>
-                    </select>
+                  <select
+                    value={slotForm.duration_minutes}
+                    onChange={(e) => setSlotForm({ ...slotForm, duration_minutes: parseInt(e.target.value, 10) })}
+                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800"
+                  >
+                    <option value={15}>15 Minutes</option>
+                    <option value={30}>30 Minutes</option>
+                    <option value={45}>45 Minutes</option>
+                    <option value={60}>60 Minutes</option>
+                  </select>
+                </div>
 
-                    <button
-                      type="submit"
-                      disabled={slotSubmitting}
-                      className="bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white font-bold px-4 py-2.5 rounded-xl text-xs whitespace-nowrap cursor-pointer shadow-xs"
-                    >
-                      {slotSubmitting ? 'Creating...' : '+ Add Slots'}
-                    </button>
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <span className="font-bold text-slate-700">Calculated End Time</span>
+                    <span className="text-[11px] font-bold text-teal-700 bg-teal-50 px-2.5 py-0.5 rounded-md border border-teal-200">
+                      {formatTime12h(calculateEndTime(slotForm.start_time, slotForm.duration_minutes)) || '09:30 AM'}
+                    </span>
                   </div>
+                  <button
+                    type="submit"
+                    disabled={slotSubmitting}
+                    className="w-full bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white font-bold px-4 py-2.5 rounded-xl text-xs whitespace-nowrap cursor-pointer shadow-xs transition"
+                  >
+                    {slotSubmitting ? 'Creating...' : '+ Add Slot'}
+                  </button>
                 </div>
               </form>
             </div>

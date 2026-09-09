@@ -1,6 +1,7 @@
 import random
 import string
 from datetime import datetime, timezone, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -15,9 +16,15 @@ from app.schemas.consultation import ConsultationResponse, ConsultationEnd
 from app.services.notification_service import create_notification
 from app.api.deps import get_current_verified_user, require_roles
 
+
 router = APIRouter(prefix="/consultations", tags=["Consultations"])
 
-def validate_time_window(appointment: Appointment, buffer_minutes_before: int = 10, buffer_minutes_after: int = 15):
+
+def validate_time_window(
+    appointment: Appointment,
+    buffer_minutes_before: int = 10,
+    buffer_minutes_after: int = 15
+):
     """
     Validates that current server time is within the appointment's scheduled slot.
     Handles small clock differences with a reasonable buffer.
@@ -29,26 +36,86 @@ def validate_time_window(appointment: Appointment, buffer_minutes_before: int = 
     if now_dt < start_dt - timedelta(minutes=buffer_minutes_before):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Consultation not started yet. Scheduled for {appointment.date.strftime('%d %b %Y')} from {appointment.start_time.strftime('%H:%M')} to {appointment.end_time.strftime('%H:%M')}."
+            detail=(
+                f"Consultation not started yet. "
+                f"Scheduled for {appointment.date.strftime('%d %b %Y')} "
+                f"from {appointment.start_time.strftime('%H:%M')} "
+                f"to {appointment.end_time.strftime('%H:%M')}."
+            )
         )
 
     if now_dt > end_dt + timedelta(minutes=buffer_minutes_after):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Consultation time slot has ended. Scheduled was {appointment.start_time.strftime('%H:%M')} - {appointment.end_time.strftime('%H:%M')}."
+            detail=(
+                f"Consultation time slot has ended. "
+                f"Scheduled was {appointment.start_time.strftime('%H:%M')} - "
+                f"{appointment.end_time.strftime('%H:%M')}."
+            )
         )
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+async def get_consultation_with_relationships(
+    consultation_id: int,
+    db: AsyncSession
+) -> Consultation:
+    """
+    Always fetch a consultation with all relationships required by
+    ConsultationResponse.
+
+    This is important for AsyncSession because returning an ORM object with
+    unloaded relationships can cause MissingGreenlet when FastAPI/Pydantic
+    serializes the response.
+    """
+    stmt = (
+        select(Consultation)
+        .options(
+            selectinload(Consultation.doctor),
+            selectinload(Consultation.patient),
+            selectinload(Consultation.appointment),
+        )
+        .where(Consultation.id == consultation_id)
+    )
+
+    result = await db.execute(stmt)
+    consultation = result.scalar_one_or_none()
+
+    if not consultation:
+        raise HTTPException(
+            status_code=404,
+            detail="Consultation not found"
+        )
+
+    return consultation
+
+
+# ---------------------------------------------------------------------------
+# Start consultation
+# ---------------------------------------------------------------------------
 
 @router.post("/start/{appointment_id}", response_model=ConsultationResponse)
 async def start_consultation_for_appointment(
     appointment_id: int,
-    current_user: User = Depends(require_roles([UserRole.DOCTOR, UserRole.ADMIN])),
+    current_user: User = Depends(
+        require_roles([UserRole.DOCTOR, UserRole.ADMIN])
+    ),
     db: AsyncSession = Depends(get_async_db)
 ):
     """
-    Doctor creates/starts the consultation record from the doctor panel (Section 8).
+    Doctor creates/starts the consultation record from the doctor panel.
+
     Patients CANNOT arbitrarily create consultation records.
-    Enforces time restriction (Section 9) and doctor ownership (Section 10).
+
+    Enforces:
+    - Time restriction
+    - Doctor ownership
+    - Existing consultation handling
     """
+
     stmt = (
         select(Appointment)
         .options(
@@ -58,26 +125,51 @@ async def start_consultation_for_appointment(
         )
         .where(Appointment.id == appointment_id)
     )
+
     res = await db.execute(stmt)
     appointment = res.scalar_one_or_none()
 
     if not appointment:
-        raise HTTPException(status_code=404, detail="Appointment not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Appointment not found"
+        )
 
     # Authorize: Only the assigned doctor or admin
     if current_user.role == UserRole.DOCTOR:
-        if not current_user.doctor_profile or appointment.doctor_id != current_user.doctor_profile.id:
-            raise HTTPException(status_code=403, detail="You are not the assigned doctor for this appointment")
+        if (
+            not current_user.doctor_profile
+            or appointment.doctor_id != current_user.doctor_profile.id
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="You are not the assigned doctor for this appointment"
+            )
 
     # Validate time window
     validate_time_window(appointment)
 
-    # If consultation already exists, return it
-    if appointment.consultation:
-        return appointment.consultation
+    # -----------------------------------------------------------------------
+    # IMPORTANT FIX:
+    # If consultation already exists, DO NOT return appointment.consultation
+    # directly. Reload it with all required relationships.
+    # -----------------------------------------------------------------------
 
+    if appointment.consultation:
+        return await get_consultation_with_relationships(
+            appointment.consultation.id,
+            db
+        )
+
+    # -----------------------------------------------------------------------
     # Create new consultation
-    room_id = f"telemed-{appointment.appointment_number.replace('#', '').lower()}"
+    # -----------------------------------------------------------------------
+
+    room_id = (
+        f"telemed-"
+        f"{appointment.appointment_number.replace('#', '').lower()}"
+    )
+
     consultation = Consultation(
         appointment_id=appointment.id,
         room_id=room_id,
@@ -87,34 +179,42 @@ async def start_consultation_for_appointment(
         doctor_joined=True,
         doctor_joined_at=datetime.now(timezone.utc)
     )
+
     db.add(consultation)
 
     # Notify patient that consultation has been opened by doctor
     if appointment.patient and appointment.patient.user_id:
-        doc_name = appointment.doctor.full_name if appointment.doctor else "Doctor"
+        doc_name = (
+            appointment.doctor.full_name
+            if appointment.doctor
+            else "Doctor"
+        )
+
         await create_notification(
             db=db,
             user_id=appointment.patient.user_id,
             title="Consultation Started",
-            message=f"Dr. {doc_name} has started your consultation room ({room_id}). You can join now.",
+            message=(
+                f"Dr. {doc_name} has started your consultation room "
+                f"({room_id}). You can join now."
+            ),
             notification_type=NotificationType.CONSULTATION,
             link=f"/consultation/{room_id}"
         )
 
     await db.commit()
 
-    # Reload consultation
-    c_stmt = (
-        select(Consultation)
-        .options(
-            selectinload(Consultation.doctor),
-            selectinload(Consultation.patient),
-            selectinload(Consultation.appointment)
-        )
-        .where(Consultation.id == consultation.id)
+    # SQLAlchemy expires objects after commit in many configurations.
+    # Therefore fetch a completely fresh instance with relationships.
+    return await get_consultation_with_relationships(
+        consultation.id,
+        db
     )
-    c_res = await db.execute(c_stmt)
-    return c_res.scalar_one()
+
+
+# ---------------------------------------------------------------------------
+# Get consultation by room
+# ---------------------------------------------------------------------------
 
 @router.get("/{room_id}", response_model=ConsultationResponse)
 async def get_consultation_by_room(
@@ -131,25 +231,53 @@ async def get_consultation_by_room(
         )
         .where(Consultation.room_id == room_id)
     )
+
     res = await db.execute(stmt)
     consultation = res.scalar_one_or_none()
 
     if not consultation:
-        raise HTTPException(status_code=404, detail="Consultation room not found. Doctor must start the consultation first.")
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Consultation room not found. "
+                "Doctor must start the consultation first."
+            )
+        )
 
-    # Verify authorization (Section 10)
+    # Verify authorization
     if current_user.role == UserRole.PATIENT:
-        if not current_user.patient_profile or consultation.patient_id != current_user.patient_profile.id:
-            raise HTTPException(status_code=403, detail="Not authorized to access this consultation room")
+        if (
+            not current_user.patient_profile
+            or consultation.patient_id != current_user.patient_profile.id
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Not authorized to access this consultation room"
+            )
+
     elif current_user.role == UserRole.DOCTOR:
-        if not current_user.doctor_profile or consultation.doctor_id != current_user.doctor_profile.id:
-            raise HTTPException(status_code=403, detail="Not authorized to access this consultation room")
+        if (
+            not current_user.doctor_profile
+            or consultation.doctor_id != current_user.doctor_profile.id
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Not authorized to access this consultation room"
+            )
 
     # Enforce time restriction if appointment attached and not yet completed
-    if consultation.appointment and consultation.status != ConsultationStatus.COMPLETED:
+    if (
+        consultation.appointment
+        and consultation.status != ConsultationStatus.COMPLETED
+    ):
         validate_time_window(consultation.appointment)
 
     return consultation
+
+
+# ---------------------------------------------------------------------------
+# Join consultation
+# ---------------------------------------------------------------------------
 
 @router.post("/{room_id}/join", response_model=ConsultationResponse)
 async def join_consultation(
@@ -166,22 +294,42 @@ async def join_consultation(
         )
         .where(Consultation.room_id == room_id)
     )
+
     res = await db.execute(stmt)
     consultation = res.scalar_one_or_none()
 
     if not consultation:
-        raise HTTPException(status_code=404, detail="Consultation room not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Consultation room not found"
+        )
 
     # Authorization Check
     if current_user.role == UserRole.PATIENT:
-        if not current_user.patient_profile or consultation.patient_id != current_user.patient_profile.id:
-            raise HTTPException(status_code=403, detail="Not authorized to join this consultation room")
+        if (
+            not current_user.patient_profile
+            or consultation.patient_id != current_user.patient_profile.id
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Not authorized to join this consultation room"
+            )
+
     elif current_user.role == UserRole.DOCTOR:
-        if not current_user.doctor_profile or consultation.doctor_id != current_user.doctor_profile.id:
-            raise HTTPException(status_code=403, detail="Not authorized to join this consultation room")
+        if (
+            not current_user.doctor_profile
+            or consultation.doctor_id != current_user.doctor_profile.id
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Not authorized to join this consultation room"
+            )
 
     # Time window validation
-    if consultation.appointment and consultation.status != ConsultationStatus.COMPLETED:
+    if (
+        consultation.appointment
+        and consultation.status != ConsultationStatus.COMPLETED
+    ):
         validate_time_window(consultation.appointment)
 
     now = datetime.now(timezone.utc)
@@ -189,20 +337,37 @@ async def join_consultation(
     if current_user.role == UserRole.DOCTOR:
         consultation.doctor_joined = True
         consultation.doctor_joined_at = now
+
     elif current_user.role == UserRole.PATIENT:
         consultation.patient_joined = True
         consultation.patient_joined_at = now
 
-    if consultation.doctor_joined_at and consultation.patient_joined_at:
+    if (
+        consultation.doctor_joined_at
+        and consultation.patient_joined_at
+    ):
         consultation.status = ConsultationStatus.ACTIVE
+
         if not consultation.started_at:
             consultation.started_at = now
+
         if consultation.appointment:
             consultation.appointment.status = AppointmentStatus.IN_PROGRESS
 
     await db.commit()
-    await db.refresh(consultation)
-    return consultation
+
+    # IMPORTANT:
+    # Do not use db.refresh(consultation) here because refresh() can leave
+    # relationships unloaded and cause MissingGreenlet during serialization.
+    return await get_consultation_with_relationships(
+        consultation.id,
+        db
+    )
+
+
+# ---------------------------------------------------------------------------
+# End consultation
+# ---------------------------------------------------------------------------
 
 @router.post("/{room_id}/end", response_model=ConsultationResponse)
 async def end_consultation(
@@ -220,27 +385,51 @@ async def end_consultation(
         )
         .where(Consultation.room_id == room_id)
     )
+
     res = await db.execute(stmt)
     consultation = res.scalar_one_or_none()
 
     if not consultation:
-        raise HTTPException(status_code=404, detail="Consultation room not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Consultation room not found"
+        )
 
     # Authorization Check
     if current_user.role == UserRole.PATIENT:
-        if not current_user.patient_profile or consultation.patient_id != current_user.patient_profile.id:
-            raise HTTPException(status_code=403, detail="Not authorized")
+        if (
+            not current_user.patient_profile
+            or consultation.patient_id != current_user.patient_profile.id
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Not authorized"
+            )
+
     elif current_user.role == UserRole.DOCTOR:
-        if not current_user.doctor_profile or consultation.doctor_id != current_user.doctor_profile.id:
-            raise HTTPException(status_code=403, detail="Not authorized")
+        if (
+            not current_user.doctor_profile
+            or consultation.doctor_id != current_user.doctor_profile.id
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Not authorized"
+            )
 
     now = datetime.now(timezone.utc)
+
     consultation.ended_at = now
     consultation.status = ConsultationStatus.COMPLETED
 
     if consultation.started_at:
-        duration = (now - consultation.started_at).total_seconds()
-        consultation.duration_seconds = max(int(duration), 60)
+        duration = (
+            now - consultation.started_at
+        ).total_seconds()
+
+        consultation.duration_seconds = max(
+            int(duration),
+            60
+        )
     else:
         consultation.duration_seconds = 180
 
@@ -256,11 +445,19 @@ async def end_consultation(
             db=db,
             user_id=consultation.patient.user_id,
             title="Consultation Completed",
-            message="Your video consultation has ended. Your doctor will issue your prescription shortly.",
+            message=(
+                "Your video consultation has ended. "
+                "Your doctor will issue your prescription shortly."
+            ),
             notification_type=NotificationType.CONSULTATION,
-            link=f"/records"
+            link="/records"
         )
 
     await db.commit()
-    await db.refresh(consultation)
-    return consultation
+
+    # IMPORTANT:
+    # Reload relationships instead of db.refresh().
+    return await get_consultation_with_relationships(
+        consultation.id,
+        db
+    )

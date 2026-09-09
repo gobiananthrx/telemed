@@ -1,7 +1,7 @@
 import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext';
-import { ProtectedPatientRoute } from './components/ProtectedRoutes';
+import { ProtectedPatientRoute, ProtectedConsultationRoute } from './components/ProtectedRoutes';
 
 // Patient Authentication Pages
 import { SignIn } from './pages/patient/SignIn';
@@ -41,6 +41,11 @@ export function App() {
           {/* Admin & Doctor Unified Portal (handles login internally if unauthenticated) */}
           <Route path="/admin" element={<AdminPortal />} />
 
+          {/* Protected Video Consultation (Patients, Doctors, Admins) */}
+          <Route element={<ProtectedConsultationRoute />}>
+            <Route path="/consultation/:roomId" element={<VideoConsultation />} />
+          </Route>
+
           {/* Protected Patient Routes */}
           <Route element={<ProtectedPatientRoute />}>
             <Route path="/" element={<HomeDashboard />} />
@@ -49,7 +54,6 @@ export function App() {
             <Route path="/book-appointment/:doctorId" element={<BookAppointment />} />
             <Route path="/booking-confirmation/:appointmentId" element={<BookingConfirmation />} />
             <Route path="/appointments" element={<Appointments />} />
-            <Route path="/consultation/:roomId" element={<VideoConsultation />} />
             <Route path="/records" element={<MedicalRecords />} />
             <Route path="/prescriptions/:id" element={<PrescriptionDetail />} />
             <Route path="/notifications" element={<Notifications />} />

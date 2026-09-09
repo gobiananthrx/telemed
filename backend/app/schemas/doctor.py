@@ -23,8 +23,9 @@ class DoctorSlotCreate(BaseModel):
 class DoctorSlotBatchCreate(BaseModel):
     date: str # "2026-09-12"
     start_time: str # "09:00"
-    end_time: str # "17:00"
+    end_time: Optional[str] = None # "17:00" or calculated dynamically
     slot_duration_minutes: int = 30
+    duration_minutes: Optional[int] = None
 
 class DoctorSlotResponse(BaseModel):
     id: int

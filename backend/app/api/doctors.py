@@ -125,11 +125,17 @@ async def create_my_slots(
     if slot_date < today:
         raise HTTPException(status_code=400, detail="Cannot create slots for past dates")
 
+    dur_mins = payload.duration_minutes or payload.slot_duration_minutes or 30
+
     try:
         st_parts = [int(p) for p in payload.start_time.split(":")]
-        et_parts = [int(p) for p in payload.end_time.split(":")]
         start_t = dt_time(st_parts[0], st_parts[1])
-        end_t = dt_time(et_parts[0], et_parts[1])
+        if payload.end_time:
+            et_parts = [int(p) for p in payload.end_time.split(":")]
+            end_t = dt_time(et_parts[0], et_parts[1])
+        else:
+            end_dt = datetime.combine(slot_date, start_t) + timedelta(minutes=dur_mins)
+            end_t = end_dt.time()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid time format. Use HH:MM")
 
@@ -148,7 +154,7 @@ async def create_my_slots(
     existing_intervals = [(s.start_time, s.end_time) for s in existing_slots]
 
     # Generate slots
-    duration = timedelta(minutes=payload.slot_duration_minutes)
+    duration = timedelta(minutes=dur_mins)
     cur_dt = datetime.combine(slot_date, start_t)
     end_dt = datetime.combine(slot_date, end_t)
 

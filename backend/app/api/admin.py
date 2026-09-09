@@ -15,7 +15,7 @@ from app.models.appointment import Appointment, AppointmentStatus
 from app.models.consultation import Consultation
 from app.models.prescription import Prescription
 from app.models.feedback import Feedback
-from app.schemas.admin import DoctorCreateByAdmin, PlatformStatsResponse
+from app.schemas.admin import DoctorCreateByAdmin, PlatformStatsResponse, AdminPatientResponse
 from app.schemas.user import DoctorProfileResponse, PatientProfileResponse
 from app.schemas.appointment import AppointmentResponse
 from app.schemas.feedback import FeedbackResponse
@@ -169,3 +169,54 @@ async def delete_doctor(
 
     await db.commit()
     return {"success": True, "message": f"Doctor {doctor.full_name} has been deleted successfully."}
+
+@router.get("/patients", response_model=List[AdminPatientResponse])
+async def list_all_patients(
+    current_user: User = Depends(require_roles([UserRole.ADMIN])),
+    db: AsyncSession = Depends(get_async_db)
+):
+    stmt = (
+        select(PatientProfile)
+        .options(selectinload(PatientProfile.user))
+        .order_by(PatientProfile.id.desc())
+    )
+    res = await db.execute(stmt)
+    patients = res.scalars().all()
+    out = []
+    for p in patients:
+        out.append(
+            AdminPatientResponse(
+                id=p.id,
+                user_id=p.user_id,
+                full_name=p.full_name,
+                email=p.user.email if p.user else None,
+                phone=p.phone,
+                blood_group=p.blood_group,
+                uhid=p.uhid,
+                city=p.city,
+                created_at=p.created_at
+            )
+        )
+    return out
+
+@router.delete("/patients/{patient_id}")
+async def delete_patient(
+    patient_id: int,
+    current_user: User = Depends(require_roles([UserRole.ADMIN])),
+    db: AsyncSession = Depends(get_async_db)
+):
+    stmt = select(PatientProfile).where(PatientProfile.id == patient_id)
+    res = await db.execute(stmt)
+    patient = res.scalar_one_or_none()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient profile not found")
+
+    user_stmt = select(User).where(User.id == patient.user_id)
+    user = (await db.execute(user_stmt)).scalar_one_or_none()
+    if user:
+        await db.delete(user)
+    else:
+        await db.delete(patient)
+
+    await db.commit()
+    return {"success": True, "message": f"Patient {patient.full_name} has been deleted successfully."}
